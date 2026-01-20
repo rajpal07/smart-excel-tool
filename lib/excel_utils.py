@@ -58,10 +58,50 @@ class ExcelHandler:
             
         return None
 
+    def _get_trimmed_bounds(self, ws):
+        """
+        Finds the true last row and column with data (ignoring empty styling).
+        Returns (max_row, max_col)
+        """
+        max_row = ws.max_row
+        max_col = ws.max_column
+        
+        # 1. Find last row with data
+        real_max_row = 1
+        # Scan blocks of rows backwards for speed? Or just iterate.
+        # Check from bottom up
+        for r in range(max_row, 0, -1):
+            # Check row r
+            row_has_data = False
+            for c in range(1, max_col + 1):
+                cell_val = ws.cell(row=r, column=c).value
+                if cell_val is not None and str(cell_val).strip() != "":
+                    row_has_data = True
+                    break
+            if row_has_data:
+                real_max_row = r
+                break
+                
+        # 2. Find last col with data
+        real_max_col = 1
+        for c in range(max_col, 0, -1):
+            col_has_data = False
+            for r in range(1, real_max_row + 1):
+                cell_val = ws.cell(row=r, column=c).value
+                if cell_val is not None and str(cell_val).strip() != "":
+                    col_has_data = True
+                    break
+            if col_has_data:
+                real_max_col = c
+                break
+                
+        return real_max_row, real_max_col
+
     def read_sheet_with_styles(self, file, sheet_name, limit=None):
         """
         Reads the sheet, extracting values AND background colors.
-        limit=None means read all rows.
+        Trims empty rows/cols to improve performance.
+        limit=None means read all data rows.
         Returns a list of rows, where each cell is {'value': val, 'bg_color': hex}.
         """
         try:
@@ -70,9 +110,18 @@ class ExcelHandler:
                 return None
             
             ws = wb[sheet_name]
+            
+            # Calculate trimmed bounds
+            max_r, max_c = self._get_trimmed_bounds(ws)
+            
+            final_max_row = max_r
+            if limit:
+                final_max_row = min(limit, max_r)
+            
             rows_data = []
             
-            for i, row in enumerate(ws.iter_rows(max_row=limit)):
+            # Iter_rows with max_col ensures we don't fetch 16000 empty columns
+            for row in ws.iter_rows(min_row=1, max_row=final_max_row, max_col=max_c):
                 row_data = []
                 for cell in row:
                     val = cell.value
@@ -192,6 +241,19 @@ class ExcelHandler:
             bgColor=fill.bgColor
         )
 
+    def _is_white_color(self, hex_color):
+        """
+        Returns True if color is white or near-white.
+        Used to determine if a cell should be considered "uncolored".
+        """
+        if not hex_color:
+            return True
+        # Remove # if present and normalize
+        clean = hex_color.replace('#', '').upper()
+        # Check common white variants
+        # FFFFFF = white, 00000000 = no fill, FEFEFE = near-white
+        return clean in ['FFFFFF', 'FFFFFFFF', 'FEFEFE', '00000000', 'FEFEFEFE']
+
     def parse_cell_value(self, val_str, col_name=""):
         """
         Parses a cell string to extract rule parameters.
@@ -212,7 +274,7 @@ class ExcelHandler:
         # "80% S" -> "80 S" -> split S -> "80".
         # "5%-10%" -> "5-10" -> split S (none) -> "5-10".
         
-        val_no_percent = val_str.replace('%', '')
+        val_no_percent = val_str.replace('%', '').replace(',', '').replace('cfu/100 ml', '').replace('(in 100 ml) #9', '')
         clean_str = re.split(r'sat|[#\*aS\^]', val_no_percent)[0].strip()
         
         # 2. Check Range "6.5-8.5"
@@ -342,6 +404,9 @@ class ExcelHandler:
              if not found_guideline:
                  print(f"No guideline row found, starting at {data_start_row} based on selection.")
         
+        # Calculate trimmed bounds for processing
+        max_r, max_c = self._get_trimmed_bounds(ws)
+        
         # Parse Rules
         col_rules = {}
         # Ensure rows are sorted by index
@@ -377,7 +442,11 @@ class ExcelHandler:
             
         # 2. Apply to Data
         count = 0
-        for row in ws.iter_rows(min_row=data_start_row):
+        
+        # Use trimmed bounds for iteration
+        iterator = ws.iter_rows(min_row=data_start_row, max_row=max_r, max_col=max_c)
+        
+        for row in iterator:
             for col_idx in target_columns_indices:
                 if col_idx >= len(row): continue
                 cell = row[col_idx]
@@ -399,11 +468,14 @@ class ExcelHandler:
                          continue
                 # -----------------------------
 
-                # --- Preserve Existing Color ---
-                # If the cell is already colored (and wasn't overridden), skip it.
-                if self.get_cell_hex(cell): 
+
+                # --- Preserve Existing Non-White Color ---
+                # If the cell already has a non-white color, skip threshold application
+                existing_color = self.get_cell_hex(cell)
+                if existing_color and not self._is_white_color(existing_color):
                     continue
                 # ------------------------------------
+
 
                 val = cell.value
                 
@@ -414,9 +486,9 @@ class ExcelHandler:
                         # If we just strip <, it becomes 0.01, which is >= 0.01 (True).
                         # So we subtract a tiny epsilon.
                         if '<' in val:
-                             f_val = float(val.replace('<','').replace('>','')) - 1e-9
+                             f_val = float(val.replace('<','').replace('>','').replace(',','')) - 1e-9
                         else:
-                             f_val = float(val.replace('<','').replace('>',''))
+                             f_val = float(val.replace('<','').replace('>','').replace(',',''))
                     else:
                         f_val = float(val)
                 except:
@@ -427,7 +499,11 @@ class ExcelHandler:
                     # 1. Find all matching rules.
                     matches = []
                     for rule in col_rules[col_idx]:
-                        if rule['min'] <= f_val <= rule['max']:
+                        is_range = (rule.get('type') == 'range')
+                        min_ok = (f_val >= rule['min']) if is_range else (f_val > rule['min'])
+                        max_ok = (f_val <= rule['max']) if is_range else (f_val < rule['max'])
+                        
+                        if min_ok and max_ok:
                             matches.append(rule)
                     
                     if matches:
@@ -472,6 +548,9 @@ class ExcelHandler:
                  cell = ws.cell(row=header_row_idx+1, column=col_idx+1)
                  col_names[col_idx] = str(cell.value) if cell.value else ""
         
+        # Calculate trimmed bounds
+        max_r, max_c = self._get_trimmed_bounds(ws)
+        
         # 1. Determine Data Start (Dup logic)
         final_start_row = data_start_row
         if final_start_row is None:
@@ -483,6 +562,10 @@ class ExcelHandler:
                      final_start_row = i + 2
                      break
         
+        # Ensure start row is within bounds
+        if final_start_row > max_r:
+            return [], final_start_row
+
         # 2. Extract Rules (Same parsing logic)
         col_rules = {} 
         sorted_rows_indices = sorted(threshold_rows_indices)
@@ -520,10 +603,12 @@ class ExcelHandler:
         preview_rows = []
         
         # Handle Limit
+        final_max_row_limit = max_r
         if limit:
-             iterator = ws.iter_rows(min_row=final_start_row, max_row=final_start_row + limit)
-        else:
-             iterator = ws.iter_rows(min_row=final_start_row)
+             final_max_row_limit = min(final_start_row + limit, max_r)
+        
+        # Use max_col to optimize
+        iterator = ws.iter_rows(min_row=final_start_row, max_row=final_max_row_limit, max_col=max_c)
              
         consecutive_empty = 0
         MAX_EMPTY = 10
@@ -565,14 +650,18 @@ class ExcelHandler:
                     try:
                         v_str = str(val if val is not None else "")
                         if '<' in v_str:
-                            f_val = float(v_str.replace('<','').replace('>','')) - 1e-9
+                            f_val = float(v_str.replace('<','').replace('>','').replace(',','')) - 1e-9
                         else:
-                            f_val = float(v_str.replace('<','').replace('>',''))
+                            f_val = float(v_str.replace('<','').replace('>','').replace(',',''))
                         
                         # Strictest Rule Logic for Preview
                         matches = []
                         for rule in col_rules[i]:
-                            if rule['min'] <= f_val <= rule['max']:
+                            is_range = (rule.get('type') == 'range')
+                            min_ok = (f_val >= rule['min']) if is_range else (f_val > rule['min'])
+                            max_ok = (f_val <= rule['max']) if is_range else (f_val < rule['max'])
+                            
+                            if min_ok and max_ok:
                                 matches.append(rule)
                                 
                         if matches:
@@ -587,5 +676,158 @@ class ExcelHandler:
                             row_data[f"Col {i}"]['bg'] = winner['hex']
                     except: pass
             preview_rows.append(row_data)
+            
+        return preview_rows, final_start_row
+
+    def preview_thresholds_from_data(self, rows_data, target_columns_indices, threshold_rows_indices, data_start_row=None, limit=None, header_row_idx=None, manual_overrides=None):
+        """
+        Generates preview using ALREADY LOADED rows_data.
+        Avoids re-opening the file.
+        """
+        if not rows_data: return [], 0
+        
+        # Get Column Names
+        col_names = {}
+        if header_row_idx is not None and header_row_idx < len(rows_data):
+             row_data = rows_data[header_row_idx]
+             for col_idx in target_columns_indices:
+                 if col_idx < len(row_data):
+                     val = row_data[col_idx]['value']
+                     col_names[col_idx] = str(val) if val else ""
+        
+        # 1. Determine Data Start (Dup logic, adapted for list)
+        final_start_row = data_start_row
+        if final_start_row is None:
+             max_thresh = max(threshold_rows_indices) if threshold_rows_indices else 0
+             final_start_row = max_thresh + 2
+             
+             # Scan top 50
+             for i, row in enumerate(rows_data[:50]):
+                 row_vals = [c['value'] for c in row if c['value']]
+                 row_str = " ".join([str(v) for v in row_vals]).lower()
+                 if "assessment guideline" in row_str or "guideline" in row_str:
+                     final_start_row = i + 2
+                     break
+        
+        if final_start_row > len(rows_data):
+             final_start_row = len(rows_data) # Safe fallback
+
+        # 2. Extract Rules
+        col_rules = {} 
+        sorted_rows_indices = sorted(threshold_rows_indices)
+        
+        for col_idx in target_columns_indices:
+            rules = []
+            c_name = col_names.get(col_idx, "")
+            
+            for r_idx in sorted_rows_indices:
+                if r_idx >= len(rows_data): continue
+                row = rows_data[r_idx]
+                if col_idx >= len(row): continue
+                
+                cell = row[col_idx]
+                # In rows_data, color is '#RRGGBB' or None.
+                bg_color = cell['bg_color']
+                if not bg_color: continue
+                # We need hex without #
+                hex_color = bg_color.replace('#', '')
+                
+                val = cell['value']
+                if val is None: continue
+                val_str = str(val).strip()
+                
+                parsed = self.parse_cell_value(val_str, col_name=c_name)
+                if parsed:
+                    rule = parsed
+                    rule['hex'] = hex_color
+                    rule['row_idx'] = r_idx 
+                    rules.append(rule)
+            
+            rules = self.resolve_column_rules(rules)
+            col_rules[col_idx] = rules
+            
+        # 3. Generate Preview Rows
+        preview_rows = []
+        
+        # Slicing is fast
+        start_idx = final_start_row - 1 # 1-based start row -> 0-based index
+        if start_idx < 0: start_idx = 0
+        
+        data_slice = rows_data[start_idx:]
+        if limit:
+            data_slice = data_slice[:limit]
+            
+        consecutive_empty = 0
+        MAX_EMPTY = 10
+        
+        for rel_idx, row in enumerate(data_slice):
+            
+            # Check Empty
+            is_empty = True
+            for c in row:
+                if c['value'] is not None and str(c['value']).strip() != "":
+                    is_empty = False
+                    break
+            if is_empty:
+                consecutive_empty += 1
+                if consecutive_empty >= MAX_EMPTY:
+                    break
+            else:
+                consecutive_empty = 0
+
+            row_out = {}
+            current_abs_row_idx = start_idx + rel_idx # 0-based absolute index
+            
+            for i, cell in enumerate(row):
+                val = cell['value']
+                bg = cell['bg_color']
+                if bg: bg = bg.replace('#', '')
+                
+                row_out[f"Col {i}"] = {'value': str(val) if val is not None else "", 'bg': None}
+                
+                # --- Manual Override ---
+                if manual_overrides and (current_abs_row_idx, i) in manual_overrides:
+                    ov = manual_overrides[(current_abs_row_idx, i)]
+                    row_out[f"Col {i}"]['bg'] = ov
+                    continue
+                
+                
+                # --- Existing Non-White Color ---
+                # Preserve pre-colored cells (skip threshold application)
+                if bg and not self._is_white_color(bg):
+                    row_out[f"Col {i}"]['bg'] = bg
+                    continue
+                
+                # --- Apply Rules ---
+                if i in target_columns_indices:
+                     try:
+                        v_str = str(val if val is not None else "")
+                        if '<' in v_str:
+                            f_val = float(v_str.replace('<','').replace('>','').replace(',','')) - 1e-9
+                        else:
+                            f_val = float(v_str.replace('<','').replace('>','').replace(',',''))
+                        
+                        matches = []
+                        for rule in col_rules[i]:
+                            is_range = (rule.get('type') == 'range')
+                            min_ok = (f_val >= rule['min']) if is_range else (f_val > rule['min'])
+                            max_ok = (f_val <= rule['max']) if is_range else (f_val < rule['max'])
+                            
+                            if min_ok and max_ok:
+                                matches.append(rule)
+                                
+                        if matches:
+                            def strictness_key(r):
+                                score = r['min']
+                                if r['min'] == float('-inf'):
+                                    score = -r['max']
+                                return (score, -r.get('row_idx', 9999))
+                            
+                            matches.sort(key=strictness_key)
+                            winner = matches[-1]
+                            row_out[f"Col {i}"]['bg'] = winner['hex']
+                     except: pass
+            
+            preview_rows.append(row_out)
             
         return preview_rows, final_start_row

@@ -1,0 +1,40 @@
+1. Identifying Rules (Parsing)
+------------------------------------------------
+The app looks at every cell in the "Threshold Rows" you selected (e.g., Rows 14, 17, 20).
+For each cell, it performs these steps:
+
+Clean Up:
+  It strips out noisy characters like %,    ,  *,  #,  S,  sat,  a.
+  Example: "1,500" becomes "1500"
+  Example: "80% S" becomes "80"
+
+Detect Type:
+  - Range (X - Y): If it sees two numbers separated by a dash (e.g., 6.5-8.5), it creates a Range Rule.
+    (Your value must be between these numbers).
+  - Explicit Signs (< or >):
+    < 5: Creates a Less Than rule (Target must be below 5).
+    > 5: Creates a Greater Than rule (Target must be above 5).
+  - Implicit (Just a Number):
+    If the cell just says "400" (and it's a pollutant column), the app assumes it is a Minimum Threshold.
+    Rule Created: "Value must be STRICTLY Greater Than 400" (not equal to).
+
+------------------------------------------------
+
+2. Coloring Logic (The "Battle" for Color)
+------------------------------------------------
+When checking a specific data value (e.g., 1500 or 5630) against the rules:
+
+Parsing:
+  The data value "1,500" is cleaned to 1500.0 (This was the bug I fixed).
+
+Find Matches:
+  The app finds ALL rules that this value satisfies.
+  Example for Chloride (Value 1500):
+    Rule 1 (Row 14, Value 1):   > 1?   YES
+    Rule 2 (Row 17, Value 350): > 350? YES
+    Rule 3 (Row 20, Value 400): > 400? YES
+
+Pick Winner (Priority):
+  Since multiple rules match, the app picks the Highest Threshold.
+  Logic: "If it exceeds 400, that is 'worse' (or more specific) than exceeding 1."
+  Winner: > 400 (Row 20 Color).
