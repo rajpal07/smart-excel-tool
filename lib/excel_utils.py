@@ -368,10 +368,10 @@ class ExcelHandler:
         The Heavy Lifter.
         """
         try:
-            wb = openpyxl.load_workbook(file_path)
+            # FORCE data_only=True to ensure we save VALUES.
+            wb = openpyxl.load_workbook(file_path, data_only=True)
         except:
-             # Fallback for some corrupted/xml issues
-             wb = openpyxl.load_workbook(file_path, data_only=False)
+             wb = openpyxl.load_workbook(file_path, data_only=True)
              
         if sheet_name not in wb: return None
         ws = wb[sheet_name]
